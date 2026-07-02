@@ -33,6 +33,15 @@ type PersistedEditorState = {
   selectedId: string | null;
 };
 
+type BackupPayload = {
+  exported_at: string;
+  user: {
+    id: string;
+    email: string | null;
+  };
+  entries: Entry[];
+};
+
 function getJstDateString(date = new Date()) {
   const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Tokyo",
@@ -52,22 +61,29 @@ function getJstDateString(date = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
+function getStableEntryTimestamp(date: string) {
+  return `${date}T12:00:00.000+09:00`;
+}
+
+const demoEntryDate = getJstDateString();
+const olderDemoEntryDate = getJstDateString(new Date(Date.now() - 86400000 * 2));
+
 const demoEntries: Entry[] = [
   {
     id: "demo-1",
     title: "静かな朝",
     body: "いつもより少し早く起きた。窓を開けると、雨上がりの匂いがした。\n\nコーヒーを淹れて、読みかけの本を数ページ。こういう余白を大切にしたい。",
-    entry_date: getJstDateString(),
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    entry_date: demoEntryDate,
+    created_at: getStableEntryTimestamp(demoEntryDate),
+    updated_at: getStableEntryTimestamp(demoEntryDate),
   },
   {
     id: "demo-2",
     title: "小さな発見",
     body: "帰り道、路地裏に新しい花屋を見つけた。淡い色の花がきれいだった。",
-    entry_date: getJstDateString(new Date(Date.now() - 86400000 * 2)),
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    entry_date: olderDemoEntryDate,
+    created_at: getStableEntryTimestamp(olderDemoEntryDate),
+    updated_at: getStableEntryTimestamp(olderDemoEntryDate),
   },
 ];
 
@@ -77,6 +93,9 @@ const isConfigured = Boolean(
 );
 
 const DRAFT_STORAGE_PREFIX = "hibi-no-yohaku-editor";
+const GOOGLE_DRIVE_TOKEN_STORAGE_KEY = "hibi-google-drive-token";
+const GOOGLE_DRIVE_FILE_STORAGE_PREFIX = "hibi-google-drive-file";
+const GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 
 function formatDate(date: string, withYear = true) {
   return new Intl.DateTimeFormat("ja-JP", {
@@ -89,6 +108,10 @@ function formatDate(date: string, withYear = true) {
 
 function getStorageKey(userId: string | null) {
   return `${DRAFT_STORAGE_PREFIX}:${userId ?? "demo"}`;
+}
+
+function getGoogleDriveFileStorageKey(userId: string) {
+  return `${GOOGLE_DRIVE_FILE_STORAGE_PREFIX}:${userId}`;
 }
 
 function compareEntries(a: Entry, b: Entry) {
@@ -134,6 +157,135 @@ function buildCalendarDays(month: string) {
   return cells;
 }
 
+function getStoredGoogleDriveToken() {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(GOOGLE_DRIVE_TOKEN_STORAGE_KEY);
+}
+
+function setStoredGoogleDriveToken(token: string | null) {
+  if (typeof window === "undefined") return;
+
+  if (!token) {
+    window.localStorage.removeItem(GOOGLE_DRIVE_TOKEN_STORAGE_KEY);
+    return;
+  }
+
+  window.localStorage.setItem(GOOGLE_DRIVE_TOKEN_STORAGE_KEY, token);
+}
+
+function getStoredGoogleDriveFileId(userId: string) {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(getGoogleDriveFileStorageKey(userId));
+}
+
+function setStoredGoogleDriveFileId(userId: string, fileId: string | null) {
+  if (typeof window === "undefined") return;
+
+  if (!fileId) {
+    window.localStorage.removeItem(getGoogleDriveFileStorageKey(userId));
+    return;
+  }
+
+  window.localStorage.setItem(getGoogleDriveFileStorageKey(userId), fileId);
+}
+
+function buildBackupFileName(userId: string) {
+  return `hibi-diary-backup-${userId}.json`;
+}
+
+async function findGoogleDriveBackupFile(
+  accessToken: string,
+  userId: string,
+) {
+  const fileName = buildBackupFileName(userId);
+  const query = [
+    `name = '${fileName.replace(/'/g, "\\'")}'`,
+    "trashed = false",
+    "mimeType = 'application/json'",
+  ].join(" and ");
+  const response = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&pageSize=1&fields=files(id,name)`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error("Google Drive のバックアップファイル確認に失敗しました。");
+  }
+
+  const data = (await response.json()) as {
+    files?: Array<{ id: string; name: string }>;
+  };
+
+  return data.files?.[0]?.id ?? null;
+}
+
+async function uploadGoogleDriveBackup(params: {
+  accessToken: string;
+  entries: Entry[];
+  userEmail: string | null;
+  userId: string;
+}) {
+  const { accessToken, entries, userEmail, userId } = params;
+  const payload: BackupPayload = {
+    exported_at: new Date().toISOString(),
+    user: {
+      id: userId,
+      email: userEmail,
+    },
+    entries: [...entries].sort(compareEntries),
+  };
+  const fileName = buildBackupFileName(userId);
+  let fileId = getStoredGoogleDriveFileId(userId);
+
+  if (!fileId) {
+    fileId = await findGoogleDriveBackupFile(accessToken, userId);
+  }
+
+  const metadata = {
+    name: fileName,
+    mimeType: "application/json",
+  };
+  const boundary = `hibi-diary-${crypto.randomUUID()}`;
+  const body =
+    `--${boundary}\r\n` +
+    "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
+    `${JSON.stringify(metadata)}\r\n` +
+    `--${boundary}\r\n` +
+    "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
+    `${JSON.stringify(payload, null, 2)}\r\n` +
+    `--${boundary}--`;
+  const endpoint = fileId
+    ? `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=multipart&fields=id`
+    : "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id";
+  const method = fileId ? "PATCH" : "POST";
+  const response = await fetch(endpoint, {
+    method,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": `multipart/related; boundary=${boundary}`,
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("Google Drive への保存権限がありません。Google で再ログインしてください。");
+    }
+
+    throw new Error("Google Drive へのバックアップ保存に失敗しました。");
+  }
+
+  const data = (await response.json()) as { id?: string };
+
+  if (data.id) {
+    setStoredGoogleDriveFileId(userId, data.id);
+  }
+}
+
 function readPersistedState(userId: string | null): PersistedEditorState | null {
   if (typeof window === "undefined") return null;
 
@@ -171,21 +323,10 @@ function mergeEntriesWithPersistedState(
 
 export default function Home() {
   const supabase = useMemo(() => (isConfigured ? createClient() : null), []);
-  const [entries, setEntries] = useState<Entry[]>(() => {
-    if (isConfigured) return [];
-
-    return readPersistedState("demo")?.entries ?? demoEntries;
-  });
-  const [selectedId, setSelectedId] = useState<string | null>(() => {
-    if (isConfigured) return null;
-
-    const persisted = readPersistedState("demo");
-    if (!persisted) return demoEntries[0].id;
-
-    return persisted.entries.some((entry) => entry.id === persisted.selectedId)
-      ? persisted.selectedId
-      : persisted.entries[0]?.id ?? null;
-  });
+  const [entries, setEntries] = useState<Entry[]>(() => (isConfigured ? [] : demoEntries));
+  const [selectedId, setSelectedId] = useState<string | null>(() =>
+    isConfigured ? null : demoEntries[0]?.id ?? null,
+  );
   const [query, setQuery] = useState("");
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(isConfigured ? null : "demo");
@@ -196,9 +337,11 @@ export default function Home() {
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [loading, setLoading] = useState(isConfigured);
   const [saving, setSaving] = useState(false);
+  const [saveMessage, setSaveMessage] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(getMonthKey(getJstDateString()));
+  const [googleDriveToken, setGoogleDriveToken] = useState<string | null>(null);
   const calendarRef = useRef<HTMLDivElement | null>(null);
 
   const selected = entries.find((entry) => entry.id === selectedId) ?? null;
@@ -223,22 +366,48 @@ export default function Home() {
   useEffect(() => {
     if (!supabase) return;
     supabase.auth.getUser().then(({ data }) => {
+      setGoogleDriveToken(getStoredGoogleDriveToken());
       setUserEmail(data.user?.email ?? null);
       setUserId(data.user?.id ?? null);
       if (data.user) loadEntries(data.user.id);
       else setLoading(false);
     });
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.provider_token) {
+        setStoredGoogleDriveToken(session.provider_token);
+        setGoogleDriveToken(session.provider_token);
+      } else if (!session) {
+        setStoredGoogleDriveToken(null);
+        setGoogleDriveToken(null);
+      }
       setUserEmail(session?.user.email ?? null);
       setUserId(session?.user.id ?? null);
       if (session?.user) loadEntries(session.user.id);
       else {
         setEntries([]);
         setSelectedId(null);
+        setSaveMessage("");
       }
     });
     return () => listener.subscription.unsubscribe();
   }, [loadEntries, supabase]);
+
+  useEffect(() => {
+    if (isConfigured) return;
+
+    const persisted = readPersistedState("demo");
+    if (!persisted) return;
+
+    const nextSelectedId = persisted.entries.some((entry) => entry.id === persisted.selectedId)
+      ? persisted.selectedId
+      : persisted.entries[0]?.id ?? null;
+    const frameId = window.requestAnimationFrame(() => {
+      setEntries(persisted.entries);
+      setSelectedId(nextSelectedId);
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, []);
 
   useEffect(() => {
     if ((isConfigured && !userId) || loading) return;
@@ -321,7 +490,10 @@ export default function Home() {
     setAuthMessage("");
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo: window.location.origin },
+      options: {
+        redirectTo: window.location.origin,
+        scopes: `${GOOGLE_DRIVE_SCOPE} openid email profile`,
+      },
     });
     if (error) {
       setAuthMessage(`Google ログインを開始できませんでした: ${error.message}`);
@@ -363,10 +535,12 @@ export default function Home() {
     if (!selected || (!selected.title.trim() && !selected.body.trim())) return;
     if (!supabase) {
       setSaving(true);
+      setSaveMessage("デモモードのため、この端末内にだけ保存されます。");
       window.setTimeout(() => setSaving(false), 500);
       return;
     }
     setSaving(true);
+    setSaveMessage("");
     const isDraft = selected.id.startsWith("draft-");
     const payload = {
       title: selected.title.trim(),
@@ -381,12 +555,35 @@ export default function Home() {
           .eq("id", selected.id)
           .select()
           .single();
-    if (!result.error && result.data) {
-      setEntries((current) =>
-        current.map((entry) => (entry.id === selected.id ? result.data : entry)),
-      );
-      setSelectedId(result.data.id);
+    if (result.error || !result.data) {
+      setSaveMessage(`保存に失敗しました: ${result.error?.message ?? "不明なエラー"}`);
+      setSaving(false);
+      return;
     }
+
+    const syncedEntries = entries.map((entry) => (entry.id === selected.id ? result.data : entry));
+    setEntries(syncedEntries);
+    setSelectedId(result.data.id);
+
+    if (!googleDriveToken || !userId) {
+      setSaveMessage("保存しました。Google Drive バックアップを使うには Google ログインが必要です。");
+      setSaving(false);
+      return;
+    }
+
+    try {
+      await uploadGoogleDriveBackup({
+        accessToken: googleDriveToken,
+        entries: syncedEntries,
+        userEmail,
+        userId,
+      });
+      setSaveMessage("保存しました。Google Drive にもバックアップ済みです。");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Google Drive バックアップに失敗しました。";
+      setSaveMessage(`保存しました。${message}`);
+    }
+
     setSaving(false);
   }
 
@@ -398,6 +595,7 @@ export default function Home() {
     const next = entries.filter((entry) => entry.id !== selected.id);
     setEntries(next);
     setSelectedId(next[0]?.id ?? null);
+    setSaveMessage("");
   }
 
   function selectPreviousEntry() {
@@ -503,7 +701,7 @@ export default function Home() {
           {authMessage && <p className="auth-message">{authMessage}</p>}
           <p className="fine-print">
             {authMode === "signin"
-              ? "メールアドレスとパスワードでログインできます。Google ログインにも対応しています。"
+              ? "メールアドレスでもログインできます。Google ログイン時は保存と同時に Google Drive バックアップも使えます。"
               : "新規登録後、Supabase の設定によっては確認メールの承認が必要です。"}
           </p>
         </section>
@@ -638,7 +836,7 @@ export default function Home() {
             <div className="actions">
               <button className="delete-button" onClick={deleteEntry} aria-label="削除"><Trash2 size={17} /></button>
               <button className="save-button" onClick={saveEntry}>
-                {saving ? <><Check size={16} /> 保存しました</> : "保存する"}
+                {saving ? <><Check size={16} /> 保存中…</> : "保存する"}
               </button>
             </div>
           )}
@@ -657,7 +855,7 @@ export default function Home() {
               className="title-input"
               value={selected.title}
               onChange={(e) => updateSelected({ title: e.target.value })}
-              placeholder="タイトル"
+              placeholder=""
               aria-label="タイトル"
             />
             <div className="rule" />
@@ -670,7 +868,10 @@ export default function Home() {
             />
             <footer className="editor-footer">
               <span>{selected.body.length} 文字</span>
-              <span>最終更新 {new Intl.DateTimeFormat("ja-JP", { hour: "2-digit", minute: "2-digit" }).format(new Date(selected.updated_at))}</span>
+              <span>
+                {saveMessage ||
+                  `最終更新 ${new Intl.DateTimeFormat("ja-JP", { hour: "2-digit", minute: "2-digit" }).format(new Date(selected.updated_at))}`}
+              </span>
             </footer>
           </article>
         ) : (
