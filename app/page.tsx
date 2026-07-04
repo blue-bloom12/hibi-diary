@@ -8,6 +8,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Cloud,
+  Download,
   KeyRound,
   LogOut,
   Menu,
@@ -223,6 +224,22 @@ async function findGoogleDriveBackupFile(
   return data.files?.[0]?.id ?? null;
 }
 
+async function resolveGoogleDriveBackupFileId(
+  accessToken: string,
+  userId: string,
+) {
+  const storedFileId = getStoredGoogleDriveFileId(userId);
+  if (storedFileId) {
+    return storedFileId;
+  }
+
+  const fileId = await findGoogleDriveBackupFile(accessToken, userId);
+  if (fileId) {
+    setStoredGoogleDriveFileId(userId, fileId);
+  }
+  return fileId;
+}
+
 async function uploadGoogleDriveBackup(params: {
   accessToken: string;
   entries: Entry[];
@@ -286,6 +303,48 @@ async function uploadGoogleDriveBackup(params: {
   }
 }
 
+async function downloadGoogleDriveBackup(
+  accessToken: string,
+  userId: string,
+) {
+  const fileId = await resolveGoogleDriveBackupFileId(accessToken, userId);
+
+  if (!fileId) {
+    throw new Error("Google Drive にバックアップファイルが見つかりませんでした。");
+  }
+
+  const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("Google Drive のバックアップを読む権限がありません。Google で再ログインしてください。");
+    }
+
+    throw new Error("Google Drive のバックアップ読み込みに失敗しました。");
+  }
+
+  const payload = (await response.json()) as Partial<BackupPayload>;
+
+  if (!Array.isArray(payload.entries)) {
+    throw new Error("バックアップファイルの形式が正しくありません。");
+  }
+
+  return payload.entries.filter((entry): entry is Entry => {
+    return (
+      typeof entry?.id === "string" &&
+      typeof entry?.title === "string" &&
+      typeof entry?.body === "string" &&
+      typeof entry?.entry_date === "string" &&
+      typeof entry?.created_at === "string" &&
+      typeof entry?.updated_at === "string"
+    );
+  });
+}
+
 function readPersistedState(userId: string | null): PersistedEditorState | null {
   if (typeof window === "undefined") return null;
 
@@ -337,6 +396,7 @@ export default function Home() {
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [loading, setLoading] = useState(isConfigured);
   const [saving, setSaving] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [saveMessage, setSaveMessage] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [calendarOpen, setCalendarOpen] = useState(false);
@@ -587,6 +647,77 @@ export default function Home() {
     setSaving(false);
   }
 
+  async function restoreEntriesFromGoogleDrive() {
+    if (!supabase || !googleDriveToken || !userId) {
+      setSaveMessage("Google Drive から復元するには Google ログインが必要です。");
+      return;
+    }
+
+    setRestoring(true);
+    setSaveMessage("");
+
+    try {
+      const backupEntries = await downloadGoogleDriveBackup(googleDriveToken, userId);
+      const restorableEntries = backupEntries.filter((entry) => !entry.id.startsWith("draft-"));
+
+      if (!restorableEntries.length) {
+        setSaveMessage("復元できる日記はバックアップ内にありませんでした。");
+        setRestoring(false);
+        return;
+      }
+
+      const backupIds = restorableEntries.map((entry) => entry.id);
+      const { data: existingData, error: existingError } = await supabase
+        .from("diary_entries")
+        .select("id")
+        .in("id", backupIds);
+
+      if (existingError) {
+        throw new Error(`既存データの確認に失敗しました: ${existingError.message}`);
+      }
+
+      const existingIds = new Set((existingData ?? []).map((entry) => entry.id));
+      const entriesToInsert = restorableEntries.filter((entry) => !existingIds.has(entry.id));
+
+      if (!entriesToInsert.length) {
+        setSaveMessage("バックアップ内の日記はすべてすでに登録済みでした。");
+        setRestoring(false);
+        return;
+      }
+
+      const { data: insertedEntries, error: insertError } = await supabase
+        .from("diary_entries")
+        .insert(
+          entriesToInsert.map((entry) => ({
+            id: entry.id,
+            user_id: userId,
+            title: entry.title,
+            body: entry.body,
+            entry_date: entry.entry_date,
+            created_at: entry.created_at,
+            updated_at: entry.updated_at,
+          })),
+        )
+        .select("*");
+
+      if (insertError) {
+        throw new Error(`復元に失敗しました: ${insertError.message}`);
+      }
+
+      const mergedEntries = [...entries, ...(insertedEntries ?? [])].sort(compareEntries);
+      setEntries(mergedEntries);
+      if (!selectedId && mergedEntries[0]) {
+        setSelectedId(mergedEntries[0].id);
+      }
+      setSaveMessage(`${insertedEntries?.length ?? entriesToInsert.length}件をGoogle Driveバックアップから復元しました。`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Google Drive からの復元に失敗しました。";
+      setSaveMessage(message);
+    }
+
+    setRestoring(false);
+  }
+
   async function deleteEntry() {
     if (!selected || !window.confirm("この日記を削除しますか？")) return;
     if (supabase && !selected.id.startsWith("draft-")) {
@@ -751,9 +882,20 @@ export default function Home() {
         </nav>
         <div className="sidebar-footer">
           <div><Cloud size={15} /><span>{isConfigured ? "クラウドに同期済み" : "デモモード"}</span></div>
-          {userEmail && (
-            <button onClick={() => supabase?.auth.signOut()} title="ログアウト"><LogOut size={16} /></button>
-          )}
+          <div className="sidebar-footer-actions">
+            {userEmail && (
+              <button
+                onClick={restoreEntriesFromGoogleDrive}
+                title="Google Driveから復元"
+                disabled={restoring}
+              >
+                <Download size={16} />
+              </button>
+            )}
+            {userEmail && (
+              <button onClick={() => supabase?.auth.signOut()} title="ログアウト"><LogOut size={16} /></button>
+            )}
+          </div>
         </div>
       </aside>
 
