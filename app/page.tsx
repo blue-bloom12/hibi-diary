@@ -34,15 +34,6 @@ type PersistedEditorState = {
   selectedId: string | null;
 };
 
-type BackupPayload = {
-  exported_at: string;
-  user: {
-    id: string;
-    email: string | null;
-  };
-  entries: Entry[];
-};
-
 function getJstDateString(date = new Date()) {
   const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Tokyo",
@@ -95,6 +86,7 @@ const isConfigured = Boolean(
 
 const DRAFT_STORAGE_PREFIX = "hibi-no-yohaku-editor";
 const GOOGLE_DRIVE_TOKEN_STORAGE_KEY = "hibi-google-drive-token";
+const GOOGLE_DRIVE_REFRESH_TOKEN_STORAGE_KEY = "hibi-google-drive-refresh-token";
 const GOOGLE_DRIVE_FILE_STORAGE_PREFIX = "hibi-google-drive-file";
 const GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 
@@ -158,11 +150,6 @@ function buildCalendarDays(month: string) {
   return cells;
 }
 
-function getStoredGoogleDriveToken() {
-  if (typeof window === "undefined") return null;
-  return window.localStorage.getItem(GOOGLE_DRIVE_TOKEN_STORAGE_KEY);
-}
-
 function setStoredGoogleDriveToken(token: string | null) {
   if (typeof window === "undefined") return;
 
@@ -174,9 +161,20 @@ function setStoredGoogleDriveToken(token: string | null) {
   window.localStorage.setItem(GOOGLE_DRIVE_TOKEN_STORAGE_KEY, token);
 }
 
-function getStoredGoogleDriveFileId(userId: string) {
+function getStoredGoogleDriveRefreshToken() {
   if (typeof window === "undefined") return null;
-  return window.localStorage.getItem(getGoogleDriveFileStorageKey(userId));
+  return window.localStorage.getItem(GOOGLE_DRIVE_REFRESH_TOKEN_STORAGE_KEY);
+}
+
+function setStoredGoogleDriveRefreshToken(token: string | null) {
+  if (typeof window === "undefined") return;
+
+  if (!token) {
+    window.localStorage.removeItem(GOOGLE_DRIVE_REFRESH_TOKEN_STORAGE_KEY);
+    return;
+  }
+
+  window.localStorage.setItem(GOOGLE_DRIVE_REFRESH_TOKEN_STORAGE_KEY, token);
 }
 
 function setStoredGoogleDriveFileId(userId: string, fileId: string | null) {
@@ -188,161 +186,6 @@ function setStoredGoogleDriveFileId(userId: string, fileId: string | null) {
   }
 
   window.localStorage.setItem(getGoogleDriveFileStorageKey(userId), fileId);
-}
-
-function buildBackupFileName(userId: string) {
-  return `hibi-diary-backup-${userId}.json`;
-}
-
-async function findGoogleDriveBackupFile(
-  accessToken: string,
-  userId: string,
-) {
-  const fileName = buildBackupFileName(userId);
-  const query = [
-    `name = '${fileName.replace(/'/g, "\\'")}'`,
-    "trashed = false",
-    "mimeType = 'application/json'",
-  ].join(" and ");
-  const response = await fetch(
-    `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&pageSize=1&fields=files(id,name)`,
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-    },
-  );
-
-  if (!response.ok) {
-    throw new Error("Google Drive のバックアップファイル確認に失敗しました。");
-  }
-
-  const data = (await response.json()) as {
-    files?: Array<{ id: string; name: string }>;
-  };
-
-  return data.files?.[0]?.id ?? null;
-}
-
-async function resolveGoogleDriveBackupFileId(
-  accessToken: string,
-  userId: string,
-) {
-  const storedFileId = getStoredGoogleDriveFileId(userId);
-  if (storedFileId) {
-    return storedFileId;
-  }
-
-  const fileId = await findGoogleDriveBackupFile(accessToken, userId);
-  if (fileId) {
-    setStoredGoogleDriveFileId(userId, fileId);
-  }
-  return fileId;
-}
-
-async function uploadGoogleDriveBackup(params: {
-  accessToken: string;
-  entries: Entry[];
-  userEmail: string | null;
-  userId: string;
-}) {
-  const { accessToken, entries, userEmail, userId } = params;
-  const payload: BackupPayload = {
-    exported_at: new Date().toISOString(),
-    user: {
-      id: userId,
-      email: userEmail,
-    },
-    entries: [...entries].sort(compareEntries),
-  };
-  const fileName = buildBackupFileName(userId);
-  let fileId = getStoredGoogleDriveFileId(userId);
-
-  if (!fileId) {
-    fileId = await findGoogleDriveBackupFile(accessToken, userId);
-  }
-
-  const metadata = {
-    name: fileName,
-    mimeType: "application/json",
-  };
-  const boundary = `hibi-diary-${crypto.randomUUID()}`;
-  const body =
-    `--${boundary}\r\n` +
-    "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
-    `${JSON.stringify(metadata)}\r\n` +
-    `--${boundary}\r\n` +
-    "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
-    `${JSON.stringify(payload, null, 2)}\r\n` +
-    `--${boundary}--`;
-  const endpoint = fileId
-    ? `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=multipart&fields=id`
-    : "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id";
-  const method = fileId ? "PATCH" : "POST";
-  const response = await fetch(endpoint, {
-    method,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": `multipart/related; boundary=${boundary}`,
-    },
-    body,
-  });
-
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      throw new Error("Google Drive への保存権限がありません。Google で再ログインしてください。");
-    }
-
-    throw new Error("Google Drive へのバックアップ保存に失敗しました。");
-  }
-
-  const data = (await response.json()) as { id?: string };
-
-  if (data.id) {
-    setStoredGoogleDriveFileId(userId, data.id);
-  }
-}
-
-async function downloadGoogleDriveBackup(
-  accessToken: string,
-  userId: string,
-) {
-  const fileId = await resolveGoogleDriveBackupFileId(accessToken, userId);
-
-  if (!fileId) {
-    throw new Error("Google Drive にバックアップファイルが見つかりませんでした。");
-  }
-
-  const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-  });
-
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      throw new Error("Google Drive のバックアップを読む権限がありません。Google で再ログインしてください。");
-    }
-
-    throw new Error("Google Drive のバックアップ読み込みに失敗しました。");
-  }
-
-  const payload = (await response.json()) as Partial<BackupPayload>;
-
-  if (!Array.isArray(payload.entries)) {
-    throw new Error("バックアップファイルの形式が正しくありません。");
-  }
-
-  return payload.entries.filter((entry): entry is Entry => {
-    return (
-      typeof entry?.id === "string" &&
-      typeof entry?.title === "string" &&
-      typeof entry?.body === "string" &&
-      typeof entry?.entry_date === "string" &&
-      typeof entry?.created_at === "string" &&
-      typeof entry?.updated_at === "string"
-    );
-  });
 }
 
 function readPersistedState(userId: string | null): PersistedEditorState | null {
@@ -401,10 +244,53 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(getMonthKey(getJstDateString()));
-  const [googleDriveToken, setGoogleDriveToken] = useState<string | null>(null);
   const calendarRef = useRef<HTMLDivElement | null>(null);
 
   const selected = entries.find((entry) => entry.id === selectedId) ?? null;
+
+  const callGoogleDriveApi = useCallback(async (path: string, init?: RequestInit) => {
+    if (!supabase) {
+      throw new Error("Google Drive 連携はデモモードでは使えません。");
+    }
+
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+
+    if (!session?.access_token) {
+      throw new Error("Google Drive 連携を使うにはログインが必要です。");
+    }
+
+    const response = await fetch(path, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${session.access_token}`,
+        ...init?.headers,
+      },
+    });
+
+    const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+    if (!response.ok) {
+      throw new Error(payload?.error ?? "Google Drive 連携に失敗しました。");
+    }
+
+    return payload;
+  }, [supabase]);
+
+  const syncGoogleDriveRefreshToken = useCallback(async () => {
+    const refreshToken = getStoredGoogleDriveRefreshToken();
+    if (!refreshToken) {
+      return false;
+    }
+
+    await callGoogleDriveApi("/api/google-drive/session", {
+      method: "POST",
+      body: JSON.stringify({ refreshToken }),
+    });
+    setStoredGoogleDriveRefreshToken(null);
+    return true;
+  }, [callGoogleDriveApi]);
 
   const loadEntries = useCallback(async (currentUserId: string | null) => {
     if (!supabase) return;
@@ -426,19 +312,25 @@ export default function Home() {
   useEffect(() => {
     if (!supabase) return;
     supabase.auth.getUser().then(({ data }) => {
-      setGoogleDriveToken(getStoredGoogleDriveToken());
       setUserEmail(data.user?.email ?? null);
       setUserId(data.user?.id ?? null);
-      if (data.user) loadEntries(data.user.id);
+      if (data.user) {
+        void syncGoogleDriveRefreshToken().catch(() => {});
+        loadEntries(data.user.id);
+      }
       else setLoading(false);
     });
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
       if (session?.provider_token) {
         setStoredGoogleDriveToken(session.provider_token);
-        setGoogleDriveToken(session.provider_token);
+      }
+      if (session?.provider_refresh_token) {
+        setStoredGoogleDriveRefreshToken(session.provider_refresh_token);
+        void syncGoogleDriveRefreshToken().catch(() => {});
       } else if (!session) {
         setStoredGoogleDriveToken(null);
-        setGoogleDriveToken(null);
+        setStoredGoogleDriveRefreshToken(null);
+        void fetch("/api/google-drive/session", { method: "DELETE" }).catch(() => {});
       }
       setUserEmail(session?.user.email ?? null);
       setUserId(session?.user.id ?? null);
@@ -450,7 +342,7 @@ export default function Home() {
       }
     });
     return () => listener.subscription.unsubscribe();
-  }, [loadEntries, supabase]);
+  }, [loadEntries, supabase, syncGoogleDriveRefreshToken]);
 
   useEffect(() => {
     if (isConfigured) return;
@@ -553,6 +445,10 @@ export default function Home() {
       options: {
         redirectTo: window.location.origin,
         scopes: `${GOOGLE_DRIVE_SCOPE} openid email profile`,
+        queryParams: {
+          access_type: "offline",
+          prompt: "consent",
+        },
       },
     });
     if (error) {
@@ -625,20 +521,21 @@ export default function Home() {
     setEntries(syncedEntries);
     setSelectedId(result.data.id);
 
-    if (!googleDriveToken || !userId) {
+    if (!userId) {
       setSaveMessage("保存しました。Google Drive バックアップを使うには Google ログインが必要です。");
       setSaving(false);
       return;
     }
 
     try {
-      await uploadGoogleDriveBackup({
-        accessToken: googleDriveToken,
-        entries: syncedEntries,
-        userEmail,
-        userId,
+      await syncGoogleDriveRefreshToken().catch(() => {});
+      await callGoogleDriveApi("/api/google-drive/backup", {
+        method: "PUT",
+        body: JSON.stringify({
+          entries: syncedEntries,
+        }),
       });
-      setSaveMessage("保存しました。Google Drive にもバックアップ済みです。");
+      setSaveMessage("保存しました。Google Drive バックアップ済み");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Google Drive バックアップに失敗しました。";
       setSaveMessage(`保存しました。${message}`);
@@ -648,7 +545,7 @@ export default function Home() {
   }
 
   async function restoreEntriesFromGoogleDrive() {
-    if (!supabase || !googleDriveToken || !userId) {
+    if (!supabase || !userId) {
       setSaveMessage("Google Drive から復元するには Google ログインが必要です。");
       return;
     }
@@ -657,7 +554,15 @@ export default function Home() {
     setSaveMessage("");
 
     try {
-      const backupEntries = await downloadGoogleDriveBackup(googleDriveToken, userId);
+      await syncGoogleDriveRefreshToken().catch(() => {});
+      const payload = (await callGoogleDriveApi("/api/google-drive/backup")) as {
+        entries?: Entry[];
+        fileId?: string | null;
+      } | null;
+      const backupEntries = Array.isArray(payload?.entries) ? payload.entries : [];
+      if (payload?.fileId) {
+        setStoredGoogleDriveFileId(userId, payload.fileId);
+      }
       const restorableEntries = backupEntries.filter((entry) => !entry.id.startsWith("draft-"));
 
       if (!restorableEntries.length) {

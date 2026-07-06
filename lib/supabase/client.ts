@@ -2,6 +2,7 @@ import { createBrowserClient } from "@supabase/ssr";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 const GOOGLE_DRIVE_TOKEN_STORAGE_KEY = "hibi-google-drive-token";
+const GOOGLE_DRIVE_REFRESH_TOKEN_STORAGE_KEY = "hibi-google-drive-refresh-token";
 
 let browserClient: SupabaseClient | null = null;
 
@@ -21,8 +22,16 @@ export function createClient() {
         window.localStorage.setItem(GOOGLE_DRIVE_TOKEN_STORAGE_KEY, session.provider_token);
       }
 
+      if (session?.provider_refresh_token) {
+        window.localStorage.setItem(
+          GOOGLE_DRIVE_REFRESH_TOKEN_STORAGE_KEY,
+          session.provider_refresh_token,
+        );
+      }
+
       if (event === "SIGNED_OUT") {
         window.localStorage.removeItem(GOOGLE_DRIVE_TOKEN_STORAGE_KEY);
+        window.localStorage.removeItem(GOOGLE_DRIVE_REFRESH_TOKEN_STORAGE_KEY);
       }
     });
   }
