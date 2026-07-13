@@ -34,6 +34,14 @@ type PersistedEditorState = {
   selectedId: string | null;
 };
 
+type PeriodPreset = "all" | "month" | "quarter" | "year" | "custom";
+
+type EntryFilters = {
+  query: string;
+  startDate: string | null;
+  endDate: string | null;
+};
+
 function getJstDateString(date = new Date()) {
   const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Tokyo",
@@ -89,6 +97,7 @@ const GOOGLE_DRIVE_TOKEN_STORAGE_KEY = "hibi-google-drive-token";
 const GOOGLE_DRIVE_REFRESH_TOKEN_STORAGE_KEY = "hibi-google-drive-refresh-token";
 const GOOGLE_DRIVE_FILE_STORAGE_PREFIX = "hibi-google-drive-file";
 const GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const ENTRY_PAGE_SIZE = 30;
 
 function formatDate(date: string, withYear = true) {
   return new Intl.DateTimeFormat("ja-JP", {
@@ -113,6 +122,108 @@ function compareEntries(a: Entry, b: Entry) {
   }
 
   return b.created_at.localeCompare(a.created_at);
+}
+
+function findEntryByDate(entries: Entry[], entryDate: string, excludeId?: string | null) {
+  return (
+    entries.find(
+      (entry) => entry.entry_date === entryDate && entry.id !== excludeId && !entry.id.startsWith("draft-"),
+    ) ?? null
+  );
+}
+
+function shiftJstMonth(dateString: string, delta: number) {
+  const [year, month, day] = dateString.split("-").map(Number);
+  const shifted = new Date(Date.UTC(year, month - 1 + delta, day, 12));
+  return getJstDateString(shifted);
+}
+
+function getFilterRange(
+  preset: PeriodPreset,
+  customStartDate: string,
+  customEndDate: string,
+) {
+  const today = getJstDateString();
+
+  switch (preset) {
+    case "month":
+      return {
+        startDate: `${today.slice(0, 7)}-01`,
+        endDate: today,
+      };
+    case "quarter":
+      return {
+        startDate: shiftJstMonth(today, -3),
+        endDate: today,
+      };
+    case "year":
+      return {
+        startDate: shiftJstMonth(today, -12),
+        endDate: today,
+      };
+    case "custom":
+      return {
+        startDate: customStartDate || null,
+        endDate: customEndDate || null,
+      };
+    default:
+      return {
+        startDate: null,
+        endDate: null,
+      };
+  }
+}
+
+function normalizeSearchTerm(value: string) {
+  return value.trim().replaceAll("%", "\\%").replaceAll("_", "\\_").replaceAll(",", " ");
+}
+
+function matchesLocalFilters(entry: Entry, filters: EntryFilters) {
+  if (filters.startDate && entry.entry_date < filters.startDate) {
+    return false;
+  }
+
+  if (filters.endDate && entry.entry_date > filters.endDate) {
+    return false;
+  }
+
+  const needle = filters.query.trim().toLocaleLowerCase("ja");
+  if (!needle) {
+    return true;
+  }
+
+  return (
+    entry.title.toLocaleLowerCase("ja").includes(needle) ||
+    entry.body.toLocaleLowerCase("ja").includes(needle)
+  );
+}
+
+function mergeVisibleEntries(params: {
+  currentEntries: Entry[];
+  incomingEntries: Entry[];
+  persisted: PersistedEditorState | null;
+  filters: EntryFilters;
+  reset: boolean;
+}) {
+  const { currentEntries, incomingEntries, persisted, filters, reset } = params;
+  const sourceEntries = reset ? (persisted?.entries ?? []) : currentEntries;
+  const drafts = sourceEntries
+    .filter((entry) => entry.id.startsWith("draft-"))
+    .filter((entry) => matchesLocalFilters(entry, filters))
+    .sort(compareEntries);
+  const localById = new Map(sourceEntries.map((entry) => [entry.id, entry]));
+  const mergedIncoming = incomingEntries.map((entry) => localById.get(entry.id) ?? entry);
+  const existingServerEntries = reset
+    ? []
+    : currentEntries.filter((entry) => !entry.id.startsWith("draft-"));
+  const serverEntries = reset
+    ? mergedIncoming
+    : [
+        ...existingServerEntries,
+        ...mergedIncoming.filter((entry) => !existingServerEntries.some((current) => current.id === entry.id)),
+      ];
+
+  return [...drafts, ...serverEntries];
 }
 
 function getMonthKey(date: string) {
@@ -203,33 +314,17 @@ function readPersistedState(userId: string | null): PersistedEditorState | null 
   }
 }
 
-function mergeEntriesWithPersistedState(
-  serverEntries: Entry[],
-  persisted: PersistedEditorState | null,
-) {
-  if (!persisted) {
-    return { entries: serverEntries, selectedId: serverEntries[0]?.id ?? null };
-  }
-
-  const persistedById = new Map(persisted.entries.map((entry) => [entry.id, entry]));
-  const mergedEntries = serverEntries.map((entry) => persistedById.get(entry.id) ?? entry);
-  const draftEntries = persisted.entries.filter((entry) => entry.id.startsWith("draft-"));
-  const entries = [...draftEntries, ...mergedEntries];
-  const fallbackSelectedId = entries[0]?.id ?? null;
-  const selectedId = entries.some((entry) => entry.id === persisted.selectedId)
-    ? persisted.selectedId
-    : fallbackSelectedId;
-
-  return { entries, selectedId };
-}
-
 export default function Home() {
   const supabase = useMemo(() => (isConfigured ? createClient() : null), []);
   const [entries, setEntries] = useState<Entry[]>(() => (isConfigured ? [] : demoEntries));
   const [selectedId, setSelectedId] = useState<string | null>(() =>
     isConfigured ? null : demoEntries[0]?.id ?? null,
   );
-  const [query, setQuery] = useState("");
+  const [queryInput, setQueryInput] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [periodPreset, setPeriodPreset] = useState<PeriodPreset>("all");
+  const [customStartDate, setCustomStartDate] = useState("");
+  const [customEndDate, setCustomEndDate] = useState("");
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(isConfigured ? null : "demo");
   const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
@@ -238,6 +333,8 @@ export default function Home() {
   const [authMessage, setAuthMessage] = useState("");
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [loading, setLoading] = useState(isConfigured);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMoreEntries, setHasMoreEntries] = useState(isConfigured);
   const [saving, setSaving] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [saveMessage, setSaveMessage] = useState("");
@@ -245,8 +342,37 @@ export default function Home() {
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(getMonthKey(getJstDateString()));
   const calendarRef = useRef<HTMLDivElement | null>(null);
+  const listEndRef = useRef<HTMLDivElement | null>(null);
+  const entriesRef = useRef<Entry[]>(entries);
+  const selectedIdRef = useRef<string | null>(selectedId);
+  const requestSequenceRef = useRef(0);
+  const loadingMoreRef = useRef(false);
 
   const selected = entries.find((entry) => entry.id === selectedId) ?? null;
+  const activeRange = useMemo(
+    () => getFilterRange(periodPreset, customStartDate, customEndDate),
+    [customEndDate, customStartDate, periodPreset],
+  );
+  const activeFilters = useMemo<EntryFilters>(
+    () => ({
+      query: searchQuery,
+      startDate: activeRange.startDate,
+      endDate: activeRange.endDate,
+    }),
+    [activeRange.endDate, activeRange.startDate, searchQuery],
+  );
+
+  useEffect(() => {
+    entriesRef.current = entries;
+  }, [entries]);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+
+  useEffect(() => {
+    loadingMoreRef.current = loadingMore;
+  }, [loadingMore]);
 
   const callGoogleDriveApi = useCallback(async (path: string, init?: RequestInit) => {
     if (!supabase) {
@@ -292,22 +418,91 @@ export default function Home() {
     return true;
   }, [callGoogleDriveApi]);
 
-  const loadEntries = useCallback(async (currentUserId: string | null) => {
+  const loadEntries = useCallback(async (currentUserId: string | null, reset = true) => {
     if (!supabase) return;
-    setLoading(true);
-    const { data, error } = await supabase
+    const requestSequence = requestSequenceRef.current + 1;
+    requestSequenceRef.current = requestSequence;
+
+    if (reset) {
+      setLoading(true);
+    } else {
+      if (loadingMoreRef.current) return;
+      setLoadingMore(true);
+    }
+
+    const persisted = readPersistedState(currentUserId);
+    const currentEntries = entriesRef.current;
+    const currentSelectedId = selectedIdRef.current;
+    const remoteCount = reset
+      ? 0
+      : currentEntries.filter((entry) => !entry.id.startsWith("draft-")).length;
+    const from = remoteCount;
+    const to = remoteCount + ENTRY_PAGE_SIZE - 1;
+    let request = supabase
       .from("diary_entries")
       .select("*")
       .order("entry_date", { ascending: false })
-      .order("created_at", { ascending: false });
-    if (!error && data) {
-      const persisted = readPersistedState(currentUserId);
-      const merged = mergeEntriesWithPersistedState(data, persisted);
-      setEntries(merged.entries);
-      setSelectedId(merged.selectedId);
+      .order("created_at", { ascending: false })
+      .range(from, to);
+
+    if (activeFilters.startDate) {
+      request = request.gte("entry_date", activeFilters.startDate);
     }
-    setLoading(false);
-  }, [supabase]);
+
+    if (activeFilters.endDate) {
+      request = request.lte("entry_date", activeFilters.endDate);
+    }
+
+    const normalizedQuery = normalizeSearchTerm(activeFilters.query);
+    if (normalizedQuery) {
+      request = request.or(`title.ilike.%${normalizedQuery}%,body.ilike.%${normalizedQuery}%`);
+    }
+
+    const { data, error } = await request;
+    if (requestSequence !== requestSequenceRef.current) {
+      return;
+    }
+
+    if (!error && data) {
+      const mergedEntries = mergeVisibleEntries({
+        currentEntries,
+        incomingEntries: data,
+        persisted,
+        filters: activeFilters,
+        reset,
+      });
+      setEntries(mergedEntries);
+      setHasMoreEntries(data.length === ENTRY_PAGE_SIZE);
+      const fallbackSelectedId = mergedEntries[0]?.id ?? null;
+
+      if (reset) {
+        const persistedSelectedId = persisted?.selectedId ?? null;
+        setSelectedId(
+          persistedSelectedId && mergedEntries.some((entry) => entry.id === persistedSelectedId)
+            ? persistedSelectedId
+            : fallbackSelectedId,
+        );
+      } else if (!currentSelectedId && fallbackSelectedId) {
+        setSelectedId(fallbackSelectedId);
+      }
+    } else {
+      setHasMoreEntries(false);
+    }
+
+    if (reset) {
+      setLoading(false);
+    } else {
+      setLoadingMore(false);
+    }
+  }, [activeFilters, supabase]);
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      setSearchQuery(queryInput);
+    }, 300);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [queryInput]);
 
   useEffect(() => {
     if (!supabase) return;
@@ -316,7 +511,6 @@ export default function Home() {
       setUserId(data.user?.id ?? null);
       if (data.user) {
         void syncGoogleDriveRefreshToken().catch(() => {});
-        loadEntries(data.user.id);
       }
       else setLoading(false);
     });
@@ -334,15 +528,24 @@ export default function Home() {
       }
       setUserEmail(session?.user.email ?? null);
       setUserId(session?.user.id ?? null);
-      if (session?.user) loadEntries(session.user.id);
-      else {
+      if (!session?.user) {
         setEntries([]);
         setSelectedId(null);
         setSaveMessage("");
+        setHasMoreEntries(false);
       }
     });
     return () => listener.subscription.unsubscribe();
-  }, [loadEntries, supabase, syncGoogleDriveRefreshToken]);
+  }, [supabase, syncGoogleDriveRefreshToken]);
+
+  useEffect(() => {
+    if (!supabase || !userId) return;
+    const timeoutId = window.setTimeout(() => {
+      void loadEntries(userId, true);
+    }, 0);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [activeFilters, loadEntries, supabase, userId]);
 
   useEffect(() => {
     if (isConfigured) return;
@@ -372,14 +575,13 @@ export default function Home() {
     window.sessionStorage.setItem(getStorageKey(userId), JSON.stringify(payload));
   }, [entries, loading, selectedId, userId]);
 
-  const visibleEntries = entries.filter((entry) => {
-    const needle = query.trim().toLocaleLowerCase("ja");
-    return (
-      !needle ||
-      entry.title.toLocaleLowerCase("ja").includes(needle) ||
-      entry.body.toLocaleLowerCase("ja").includes(needle)
-    );
-  });
+  const visibleEntries = useMemo(() => {
+    if (!isConfigured) {
+      return entries.filter((entry) => matchesLocalFilters(entry, activeFilters));
+    }
+
+    return entries;
+  }, [activeFilters, entries]);
   const navigableEntries = visibleEntries.some((entry) => entry.id === selectedId)
     ? [...visibleEntries].sort(compareEntries)
     : [...entries].sort(compareEntries);
@@ -391,6 +593,24 @@ export default function Home() {
     return new Map(sorted.map((entry) => [entry.entry_date, entry]));
   }, [entries]);
   const calendarDays = useMemo(() => buildCalendarDays(calendarMonth), [calendarMonth]);
+  const filterSummary = useMemo(() => {
+    if (searchQuery.trim()) {
+      return `「${searchQuery}」の検索結果`;
+    }
+
+    switch (periodPreset) {
+      case "month":
+        return "今月の日記";
+      case "quarter":
+        return "過去3か月の日記";
+      case "year":
+        return "過去1年の日記";
+      case "custom":
+        return "指定期間の日記";
+      default:
+        return "最近の日記";
+    }
+  }, [periodPreset, searchQuery]);
 
   useEffect(() => {
     if (!calendarOpen) return;
@@ -404,6 +624,21 @@ export default function Home() {
     document.addEventListener("pointerdown", handlePointerDown);
     return () => document.removeEventListener("pointerdown", handlePointerDown);
   }, [calendarOpen]);
+
+  useEffect(() => {
+    if (!isConfigured || !userId || !hasMoreEntries || loading || loadingMore || !listEndRef.current) return;
+
+    const observer = new IntersectionObserver((observedEntries) => {
+      const [entry] = observedEntries;
+      if (!entry?.isIntersecting) return;
+      void loadEntries(userId, false);
+    }, {
+      rootMargin: "120px 0px",
+    });
+
+    observer.observe(listEndRef.current);
+    return () => observer.disconnect();
+  }, [hasMoreEntries, loadEntries, loading, loadingMore, userId]);
 
   async function handleEmailAuth(event: FormEvent) {
     event.preventDefault();
@@ -459,11 +694,21 @@ export default function Home() {
 
   function createEntry() {
     const now = new Date();
+    const today = getJstDateString(now);
+    const existingEntry = findEntryByDate(entriesRef.current, today);
+
+    if (existingEntry) {
+      setSelectedId(existingEntry.id);
+      setSaveMessage("今日はすでに日記があります。既存の日記を開きました。");
+      setSidebarOpen(false);
+      return;
+    }
+
     const draft: Entry = {
       id: `draft-${crypto.randomUUID()}`,
       title: "",
       body: "",
-      entry_date: getJstDateString(now),
+      entry_date: today,
       created_at: now.toISOString(),
       updated_at: now.toISOString(),
     };
@@ -497,7 +742,46 @@ export default function Home() {
     }
     setSaving(true);
     setSaveMessage("");
+    const conflictingEntry = findEntryByDate(entriesRef.current, selected.entry_date, selected.id);
+
+    if (conflictingEntry) {
+      setSelectedId(conflictingEntry.id);
+      setSaveMessage("その日付の日記はすでにあります。1日に保存できる日記は1件だけです。");
+      setSaving(false);
+      return;
+    }
+
     const isDraft = selected.id.startsWith("draft-");
+    let duplicateQuery = supabase
+      .from("diary_entries")
+      .select("*")
+      .eq("entry_date", selected.entry_date)
+      .limit(1);
+
+    if (!isDraft) {
+      duplicateQuery = duplicateQuery.neq("id", selected.id);
+    }
+
+    const { data: serverDuplicate, error: duplicateCheckError } = await duplicateQuery.maybeSingle();
+
+    if (duplicateCheckError) {
+      setSaveMessage(`同じ日の日記を確認できませんでした: ${duplicateCheckError.message}`);
+      setSaving(false);
+      return;
+    }
+
+    if (serverDuplicate) {
+      setEntries((current) =>
+        current.some((entry) => entry.id === serverDuplicate.id)
+          ? current
+          : [serverDuplicate, ...current].sort(compareEntries),
+      );
+      setSelectedId(serverDuplicate.id);
+      setSaveMessage("その日付の日記はすでにあります。既存の日記を開きました。");
+      setSaving(false);
+      return;
+    }
+
     const payload = {
       title: selected.title.trim(),
       body: selected.body,
@@ -512,6 +796,25 @@ export default function Home() {
           .select()
           .single();
     if (result.error || !result.data) {
+      if (result.error?.code === "23505") {
+        const { data: existingEntry } = await supabase
+          .from("diary_entries")
+          .select("*")
+          .eq("entry_date", selected.entry_date)
+          .maybeSingle();
+
+        if (existingEntry) {
+          setEntries((current) =>
+            current.some((entry) => entry.id === existingEntry.id)
+              ? current
+              : [existingEntry, ...current].sort(compareEntries),
+          );
+          setSelectedId(existingEntry.id);
+        }
+        setSaveMessage("その日付の日記はすでにあります。1日に保存できる日記は1件だけです。");
+        setSaving(false);
+        return;
+      }
       setSaveMessage(`保存に失敗しました: ${result.error?.message ?? "不明なエラー"}`);
       setSaving(false);
       return;
@@ -531,9 +834,6 @@ export default function Home() {
       await syncGoogleDriveRefreshToken().catch(() => {});
       await callGoogleDriveApi("/api/google-drive/backup", {
         method: "PUT",
-        body: JSON.stringify({
-          entries: syncedEntries,
-        }),
       });
       setSaveMessage("保存しました。Google Drive バックアップ済み");
     } catch (error) {
@@ -563,7 +863,14 @@ export default function Home() {
       if (payload?.fileId) {
         setStoredGoogleDriveFileId(userId, payload.fileId);
       }
-      const restorableEntries = backupEntries.filter((entry) => !entry.id.startsWith("draft-"));
+      const backupEntryDatesSeen = new Set<string>();
+      const restorableEntries = backupEntries.filter((entry) => {
+        if (entry.id.startsWith("draft-") || backupEntryDatesSeen.has(entry.entry_date)) {
+          return false;
+        }
+        backupEntryDatesSeen.add(entry.entry_date);
+        return true;
+      });
 
       if (!restorableEntries.length) {
         setSaveMessage("復元できる日記はバックアップ内にありませんでした。");
@@ -572,17 +879,28 @@ export default function Home() {
       }
 
       const backupIds = restorableEntries.map((entry) => entry.id);
+      const backupEntryDates = restorableEntries.map((entry) => entry.entry_date);
       const { data: existingData, error: existingError } = await supabase
         .from("diary_entries")
         .select("id")
         .in("id", backupIds);
 
-      if (existingError) {
-        throw new Error(`既存データの確認に失敗しました: ${existingError.message}`);
+      const { data: existingDateData, error: existingDateError } = await supabase
+        .from("diary_entries")
+        .select("entry_date")
+        .in("entry_date", backupEntryDates);
+
+      if (existingError || existingDateError) {
+        throw new Error(
+          `既存データの確認に失敗しました: ${existingError?.message ?? existingDateError?.message}`,
+        );
       }
 
       const existingIds = new Set((existingData ?? []).map((entry) => entry.id));
-      const entriesToInsert = restorableEntries.filter((entry) => !existingIds.has(entry.id));
+      const existingEntryDates = new Set((existingDateData ?? []).map((entry) => entry.entry_date));
+      const entriesToInsert = restorableEntries.filter(
+        (entry) => !existingIds.has(entry.id) && !existingEntryDates.has(entry.entry_date),
+      );
 
       if (!entriesToInsert.length) {
         setSaveMessage("バックアップ内の日記はすべてすでに登録済みでした。");
@@ -609,11 +927,7 @@ export default function Home() {
         throw new Error(`復元に失敗しました: ${insertError.message}`);
       }
 
-      const mergedEntries = [...entries, ...(insertedEntries ?? [])].sort(compareEntries);
-      setEntries(mergedEntries);
-      if (!selectedId && mergedEntries[0]) {
-        setSelectedId(mergedEntries[0].id);
-      }
+      await loadEntries(userId, true);
       setSaveMessage(`${insertedEntries?.length ?? entriesToInsert.length}件をGoogle Driveバックアップから復元しました。`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Google Drive からの復元に失敗しました。";
@@ -763,14 +1077,47 @@ export default function Home() {
         <div className="search-box">
           <Search size={16} />
           <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            value={queryInput}
+            onChange={(e) => setQueryInput(e.target.value)}
             placeholder="日記を検索…"
             aria-label="日記を検索"
           />
-          {query && <button onClick={() => setQuery("")}><X size={14} /></button>}
+          {queryInput && <button onClick={() => setQueryInput("")}><X size={14} /></button>}
         </div>
-        <div className="entry-count">{query ? `「${query}」の検索結果` : "最近の日記"} <span>{visibleEntries.length}</span></div>
+        <div className="filter-panel">
+          <div className="filter-row">
+            <label htmlFor="period-preset">期間</label>
+            <select
+              id="period-preset"
+              value={periodPreset}
+              onChange={(e) => setPeriodPreset(e.target.value as PeriodPreset)}
+            >
+              <option value="all">すべて</option>
+              <option value="month">今月</option>
+              <option value="quarter">過去3か月</option>
+              <option value="year">過去1年</option>
+              <option value="custom">カスタム</option>
+            </select>
+          </div>
+          {periodPreset === "custom" && (
+            <div className="filter-range">
+              <input
+                type="date"
+                value={customStartDate}
+                onChange={(e) => setCustomStartDate(e.target.value)}
+                aria-label="開始日"
+              />
+              <span>〜</span>
+              <input
+                type="date"
+                value={customEndDate}
+                onChange={(e) => setCustomEndDate(e.target.value)}
+                aria-label="終了日"
+              />
+            </div>
+          )}
+        </div>
+        <div className="entry-count">{filterSummary} <span>{visibleEntries.length}{hasMoreEntries ? "+" : ""}</span></div>
         <nav className="entry-list">
           {visibleEntries.map((entry) => (
             <button
@@ -783,7 +1130,9 @@ export default function Home() {
               <p>{entry.body || ""}</p>
             </button>
           ))}
-          {!visibleEntries.length && <p className="empty-search">見つかりませんでした。<br />別の言葉で探してみてください。</p>}
+          {!visibleEntries.length && !loading && <p className="empty-search">見つかりませんでした。<br />別の条件で探してみてください。</p>}
+          {loadingMore && <p className="entry-loading">さらに読み込み中…</p>}
+          {!loading && hasMoreEntries && <div ref={listEndRef} className="entry-list-sentinel" aria-hidden="true" />}
         </nav>
         <div className="sidebar-footer">
           <div><Cloud size={15} /><span>{isConfigured ? "クラウドに同期済み" : "デモモード"}</span></div>
