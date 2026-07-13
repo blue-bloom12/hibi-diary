@@ -48,6 +48,21 @@ body {
 .search-box svg { color: #939892; }
 .search-box input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; font-size: 12px; }
 .search-box button { display: grid; place-items: center; border: 0; padding: 3px; background: none; color: var(--muted); }
+.filter-panel { margin: -8px 20px 18px; display: flex; flex-direction: column; gap: 10px; }
+.filter-row { display: flex; align-items: center; gap: 10px; }
+.filter-row label { font: 10px var(--font-inter), sans-serif; letter-spacing: .16em; color: #92958f; text-transform: uppercase; }
+.filter-row select, .filter-range input {
+  height: 34px; border: 1px solid #e2dfd7; outline: 0; background: #faf9f5; color: #5d6661;
+  font-size: 12px;
+}
+.filter-row select { flex: 1; padding: 0 11px; }
+.filter-reset {
+  flex: 0 0 auto; padding: 0 2px; border: 0; background: transparent; color: #92958f;
+  font-size: 10px; letter-spacing: .04em; text-decoration: underline; text-underline-offset: 3px;
+}
+.filter-reset:hover { color: var(--sage-dark); }
+.filter-range { display: flex; align-items: center; gap: 7px; color: #91958e; }
+.filter-range input { flex: 1; min-width: 0; padding: 0 10px; }
 .entry-count {
   padding: 0 24px 10px; display: flex; justify-content: space-between;
   font: 10px var(--font-inter), sans-serif; letter-spacing: .16em; color: #92958f; text-transform: uppercase;
@@ -63,6 +78,8 @@ body {
 .entry-item strong { display: block; margin-bottom: 5px; font-size: 14px; letter-spacing: .05em; }
 .entry-item p { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; line-height: 1.7; color: #878c87; }
 .empty-search { padding: 30px; text-align: center; font-size: 12px; line-height: 2; color: var(--muted); }
+.entry-loading { margin: 0; padding: 18px 24px 24px; text-align: center; font-size: 11px; letter-spacing: .1em; color: #8d938d; }
+.entry-list-sentinel { height: 1px; }
 .sidebar-footer { height: 57px; padding: 0 22px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid var(--line); }
 .sidebar-footer div { display: flex; align-items: center; gap: 7px; font: 10px var(--font-inter), sans-serif; color: #828a85; }
 .sidebar-footer button { border: 0; padding: 7px; display: grid; place-items: center; background: transparent; color: #7c8580; }

@@ -98,7 +98,43 @@ async function getAuthenticatedUser(request: Request) {
     throw new Error("ログイン状態を確認できませんでした。");
   }
 
-  return user;
+  return { token, user };
+}
+
+async function getAllDiaryEntries(token: string) {
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
+    {
+      global: {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      },
+    },
+  );
+  const entries: Entry[] = [];
+  const pageSize = 1000;
+
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await supabase
+      .from("diary_entries")
+      .select("id,title,body,entry_date,created_at,updated_at")
+      .order("entry_date", { ascending: false })
+      .order("created_at", { ascending: false })
+      .range(from, from + pageSize - 1);
+
+    if (error) {
+      throw new Error(`日記の全件取得に失敗しました: ${error.message}`);
+    }
+
+    const pageEntries = (data ?? []).map(toEntry).filter((entry): entry is Entry => Boolean(entry));
+    entries.push(...pageEntries);
+
+    if (!data || data.length < pageSize) {
+      return entries;
+    }
+  }
 }
 
 async function getRefreshTokenForUser(userId: string) {
@@ -270,13 +306,10 @@ async function downloadGoogleDriveBackup(accessToken: string, userId: string) {
 
 export async function PUT(request: Request) {
   try {
-    const user = await getAuthenticatedUser(request);
+    const { token, user } = await getAuthenticatedUser(request);
     const refreshToken = await getRefreshTokenForUser(user.id);
     const accessToken = await getGoogleAccessToken(refreshToken);
-    const body = (await request.json()) as { entries?: unknown[] };
-    const entries = Array.isArray(body.entries)
-      ? body.entries.map(toEntry).filter((entry): entry is Entry => Boolean(entry))
-      : [];
+    const entries = await getAllDiaryEntries(token);
 
     if (!entries.length) {
       return Response.json({ error: "バックアップする日記がありません。" }, { status: 400 });
@@ -298,7 +331,7 @@ export async function PUT(request: Request) {
 
 export async function GET(request: Request) {
   try {
-    const user = await getAuthenticatedUser(request);
+    const { user } = await getAuthenticatedUser(request);
     const refreshToken = await getRefreshTokenForUser(user.id);
     const accessToken = await getGoogleAccessToken(refreshToken);
     const payload = await downloadGoogleDriveBackup(accessToken, user.id);

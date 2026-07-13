@@ -32,6 +32,8 @@ create policy "Users can delete their own entries"
 
 create index diary_entries_user_date_idx
   on public.diary_entries (user_id, entry_date desc);
+create unique index if not exists diary_entries_user_entry_date_unique_idx
+  on public.diary_entries (user_id, entry_date);
 create index diary_entries_title_search_idx
   on public.diary_entries using gin (title gin_trgm_ops);
 create index diary_entries_body_search_idx
