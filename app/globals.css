@@ -56,6 +56,11 @@ body {
   font-size: 12px;
 }
 .filter-row select { flex: 1; padding: 0 11px; }
+.filter-reset {
+  flex: 0 0 auto; padding: 0 2px; border: 0; background: transparent; color: #92958f;
+  font-size: 10px; letter-spacing: .04em; text-decoration: underline; text-underline-offset: 3px;
+}
+.filter-reset:hover { color: var(--sage-dark); }
 .filter-range { display: flex; align-items: center; gap: 7px; color: #91958e; }
 .filter-range input { flex: 1; min-width: 0; padding: 0 10px; }
 .entry-count {

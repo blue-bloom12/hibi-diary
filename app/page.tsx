@@ -42,6 +42,10 @@ type EntryFilters = {
   endDate: string | null;
 };
 
+function hasEntryContent(entry: Entry) {
+  return Boolean(entry.title.trim() || entry.body.trim());
+}
+
 function getJstDateString(date = new Date()) {
   const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Tokyo",
@@ -124,10 +128,18 @@ function compareEntries(a: Entry, b: Entry) {
   return b.created_at.localeCompare(a.created_at);
 }
 
-function findEntryByDate(entries: Entry[], entryDate: string, excludeId?: string | null) {
+function findEntryByDate(
+  entries: Entry[],
+  entryDate: string,
+  excludeId?: string | null,
+  includeDraft = false,
+) {
   return (
     entries.find(
-      (entry) => entry.entry_date === entryDate && entry.id !== excludeId && !entry.id.startsWith("draft-"),
+      (entry) =>
+        entry.entry_date === entryDate &&
+        entry.id !== excludeId &&
+        (includeDraft || !entry.id.startsWith("draft-")),
     ) ?? null
   );
 }
@@ -172,6 +184,19 @@ function getFilterRange(
         endDate: null,
       };
   }
+}
+
+function normalizeDateInput(value: string) {
+  const dateParts = value.match(/^(\d+)-(\d{1,2})-(\d{1,2})$/);
+  if (dateParts) {
+    const [, year, month, day] = dateParts;
+    return `${year.slice(0, 4)}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+  }
+
+  const digits = value.replace(/[^0-9]/g, "").slice(0, 8);
+  if (digits.length <= 4) return digits;
+  if (digits.length <= 6) return `${digits.slice(0, 4)}-${digits.slice(4)}`;
+  return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6)}`;
 }
 
 function normalizeSearchTerm(value: string) {
@@ -308,7 +333,11 @@ function readPersistedState(userId: string | null): PersistedEditorState | null 
   try {
     const parsed = JSON.parse(raw) as PersistedEditorState;
     if (!Array.isArray(parsed.entries)) return null;
-    return parsed;
+    const entries = parsed.entries.filter(hasEntryContent);
+    return {
+      entries,
+      selectedId: entries.some((entry) => entry.id === parsed.selectedId) ? parsed.selectedId : null,
+    };
   } catch {
     return null;
   }
@@ -567,9 +596,10 @@ export default function Home() {
   useEffect(() => {
     if ((isConfigured && !userId) || loading) return;
 
+    const persistedEntries = entries.filter(hasEntryContent);
     const payload: PersistedEditorState = {
-      entries,
-      selectedId,
+      entries: persistedEntries,
+      selectedId: persistedEntries.some((entry) => entry.id === selectedId) ? selectedId : null,
     };
 
     window.sessionStorage.setItem(getStorageKey(userId), JSON.stringify(payload));
@@ -588,6 +618,32 @@ export default function Home() {
   const selectedIndex = navigableEntries.findIndex((entry) => entry.id === selectedId);
   const previousEntry = selectedIndex >= 0 ? navigableEntries[selectedIndex + 1] ?? null : null;
   const nextEntry = selectedIndex > 0 ? navigableEntries[selectedIndex - 1] : null;
+
+  useEffect(() => {
+    function handleEntryNavigation(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.tagName === "SELECT" ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+
+      if (event.key === "ArrowUp" && nextEntry) {
+        event.preventDefault();
+        setSelectedId(nextEntry.id);
+      } else if (event.key === "ArrowDown" && previousEntry) {
+        event.preventDefault();
+        setSelectedId(previousEntry.id);
+      }
+    }
+
+    document.addEventListener("keydown", handleEntryNavigation);
+    return () => document.removeEventListener("keydown", handleEntryNavigation);
+  }, [nextEntry, previousEntry]);
+
   const entriesByDate = useMemo(() => {
     const sorted = [...entries].sort(compareEntries);
     return new Map(sorted.map((entry) => [entry.entry_date, entry]));
@@ -692,10 +748,9 @@ export default function Home() {
     }
   }
 
-  function createEntry() {
+  function createEntry(entryDate = getJstDateString()) {
     const now = new Date();
-    const today = getJstDateString(now);
-    const existingEntry = findEntryByDate(entriesRef.current, today);
+    const existingEntry = findEntryByDate(entriesRef.current, entryDate, null, true);
 
     if (existingEntry) {
       setSelectedId(existingEntry.id);
@@ -708,7 +763,7 @@ export default function Home() {
       id: `draft-${crypto.randomUUID()}`,
       title: "",
       body: "",
-      entry_date: today,
+      entry_date: entryDate,
       created_at: now.toISOString(),
       updated_at: now.toISOString(),
     };
@@ -958,6 +1013,12 @@ export default function Home() {
     setSelectedId(nextEntry.id);
   }
 
+  function resetPeriodFilter() {
+    setPeriodPreset("all");
+    setCustomStartDate("");
+    setCustomEndDate("");
+  }
+
   function toggleCalendar() {
     if (!calendarOpen && selected) {
       setCalendarMonth(getMonthKey(selected.entry_date));
@@ -967,8 +1028,11 @@ export default function Home() {
 
   function selectEntryByDate(date: string) {
     const entry = entriesByDate.get(date);
-    if (!entry) return;
-    setSelectedId(entry.id);
+    if (entry) {
+      setSelectedId(entry.id);
+    } else {
+      createEntry(date);
+    }
     setCalendarOpen(false);
   }
 
@@ -1073,7 +1137,7 @@ export default function Home() {
           </div>
           <button className="close-mobile" onClick={() => setSidebarOpen(false)}><X size={20} /></button>
         </div>
-        <button className="new-entry" onClick={createEntry}><Plus size={17} /> 新しい日記を書く</button>
+        <button className="new-entry" onClick={() => createEntry()}><Plus size={17} /> 新しい日記を書く</button>
         <div className="search-box">
           <Search size={16} />
           <input
@@ -1098,24 +1162,38 @@ export default function Home() {
               <option value="year">過去1年</option>
               <option value="custom">カスタム</option>
             </select>
+            <button
+              type="button"
+              className="filter-reset"
+              onClick={resetPeriodFilter}
+              aria-label="期間選択をリセット"
+            >
+              リセット
+            </button>
           </div>
-          {periodPreset === "custom" && (
-            <div className="filter-range">
-              <input
-                type="date"
-                value={customStartDate}
-                onChange={(e) => setCustomStartDate(e.target.value)}
-                aria-label="開始日"
-              />
-              <span>〜</span>
-              <input
-                type="date"
-                value={customEndDate}
-                onChange={(e) => setCustomEndDate(e.target.value)}
-                aria-label="終了日"
-              />
-            </div>
-          )}
+          <div className="filter-range">
+            <input
+              type="date"
+              max="9999-12-31"
+              value={customStartDate}
+              onChange={(e) => {
+                setCustomStartDate(normalizeDateInput(e.target.value));
+                setPeriodPreset("custom");
+              }}
+              aria-label="開始日"
+            />
+            <span>〜</span>
+            <input
+              type="date"
+              max="9999-12-31"
+              value={customEndDate}
+              onChange={(e) => {
+                setCustomEndDate(normalizeDateInput(e.target.value));
+                setPeriodPreset("custom");
+              }}
+              aria-label="終了日"
+            />
+          </div>
         </div>
         <div className="entry-count">{filterSummary} <span>{visibleEntries.length}{hasMoreEntries ? "+" : ""}</span></div>
         <nav className="entry-list">
@@ -1212,7 +1290,6 @@ export default function Home() {
                           key={date}
                           type="button"
                           className={`calendar-day${hasEntry ? " has-entry" : ""}${isSelected ? " selected" : ""}`}
-                          disabled={!hasEntry}
                           onClick={() => selectEntryByDate(date)}
                         >
                           {Number(date.slice(-2))}
@@ -1275,7 +1352,7 @@ export default function Home() {
             <div className="brand-mark"><BookOpen size={22} /></div>
             <h2>今日を残しておきましょう</h2>
             <p>何気ない一日も、あとから読み返すと大切な物語になります。</p>
-            <button className="primary-button compact" onClick={createEntry}><Plus size={17} /> 日記を書く</button>
+            <button className="primary-button compact" onClick={() => createEntry()}><Plus size={17} /> 日記を書く</button>
           </div>
         )}
       </section>
